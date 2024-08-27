@@ -50,108 +50,107 @@ const createSession = async (sessionId, isLegacy = false, res = null) => {
 
     let state, saveCreds;
 
-    if (isLegacy) {
-        // Configuración específica para sesiones legacy
-    } else {
-        ({ state, saveCreds } = await useMultiFileAuthState(sessionsDir(sessionFileName)));
-    }
+    try {
+        if (!isLegacy) {
+            ({ state, saveCreds } = await useMultiFileAuthState(sessionsDir(sessionFileName)));
+        }
 
-    const connectionOptions = {
-        auth: state,
-        version: [2, 1541, 1],
-        printQRInTerminal: false,
-        logger: logger,
-        browser: Browsers.chrome('Chrome'),
-        patchMessageBeforeSending: (message) => {
-            if (message.buttonsMessage || message.listMessage) {
-                message = {
-                    viewOnceMessage: {
-                        message: {
-                            messageContextInfo: {
-                                deviceListMetadataVersion: 2,
-                                deviceListMetadata: {}
-                            },
-                            ...message
+        const connectionOptions = {
+            auth: state,
+            version: [2, 1541, 1],
+            printQRInTerminal: false,
+            logger: logger,
+            browser: Browsers.macOS('Safari'), // Define un navegador alternativo
+            patchMessageBeforeSending: (message) => {
+                if (message.buttonsMessage || message.listMessage) {
+                    message = {
+                        viewOnceMessage: {
+                            message: {
+                                messageContextInfo: {
+                                    deviceListMetadataVersion: 2,
+                                    deviceListMetadata: {}
+                                },
+                                ...message
+                            }
                         }
+                    };
+                }
+                return message;
+            }
+        };
+
+        const connection = makeInMemoryStore(connectionOptions);
+
+        if (!connection || !connection.ev) {
+            throw new Error('Failed to initialize connection or event emitter is undefined');
+        }
+
+        if (!isLegacy) {
+            store.readFromFile(sessionsDir(`${sessionId}_store.json`));
+            store.bind(connection.ev);
+        }
+
+        sessions.set(sessionId, { ...connection, store, isLegacy });
+
+        // Manejo de eventos de conexión
+        connection.ev.on('creds.update', saveCreds);
+        connection.ev.on('chats.set', ({ chats }) => {
+            if (isLegacy) store.chats.insertIfAbsent(...chats);
+        });
+
+        // Evento de actualización de conexión
+        connection.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+
+            if (connection === 'open') {
+                retries.delete(sessionId);
+            } else if (connection === 'close') {
+                if (statusCode === DisconnectReason.loggedOut || !shouldReconnect(sessionId)) {
+                    if (res && !res.headersSent) {
+                        response(res, 500, false, 'Unable to create session.');
                     }
-                };
-            }
-            return message;
-        }
-    };
-
-    const connection = await makeInMemoryStore(connectionOptions);
-
-    if (!isLegacy) {
-        store.readFromFile(sessionsDir(`${sessionId}_store.json`));
-        store.bind(connection.ev);
-    }
-
-    sessions.set(sessionId, { ...connection, store, isLegacy });
-
-    // Manejo de eventos de conexión
-    connection.ev.on('creds.update', saveCreds);
-    connection.ev.on('chats.set', ({ chats }) => {
-        if (isLegacy) store.chats.insertIfAbsent(...chats);
-    });
-
-    // Evento para manejar actualizaciones de mensajes
-    connection.ev.on('messages.upsert', async (message) => {
-        try {
-            const msg = message.messages[0];
-            if (!msg.key.fromMe && message.type === 'notify') {
-                const dataToSend = {
-                    remoteJid: msg.key.remoteJid,
-                    sessionId,
-                    messageId: msg.key.id,
-                    message: msg.message
-                };
-                sentWebHook(sessionId, dataToSend);
-            }
-        } catch (error) {
-            console.error('Error handling message upsert:', error);
-        }
-    });
-
-    // Manejo de la actualización de conexión
-    connection.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-
-        if (connection === 'open') {
-            retries.delete(sessionId);
-        } else if (connection === 'close') {
-            if (statusCode === DisconnectReason.loggedOut || !shouldReconnect(sessionId)) {
-                if (res && !res.headersSent) {
-                    response(res, 500, false, 'Unable to create session.');
-                }
-                deleteSession(sessionId, isLegacy);
-                return;
-            }
-            setTimeout(() => {
-                createSession(sessionId, isLegacy, res);
-            }, statusCode === DisconnectReason.restartRequired ? 0 : parseInt(process.env.WA_SERVER_RECONNECT_INTERVAL ?? 0));
-        }
-
-        if (update.qr) {
-            if (res && !res.headersSent) {
-                try {
-                    const qrCode = await toDataURL(update.qr);
-                    response(res, 200, true, 'QR code received, please scan the QR code.', { qr: qrCode });
+                    deleteSession(sessionId, isLegacy);
                     return;
-                } catch {
-                    response(res, 500, false, 'Unable to create QR code.');
                 }
+                setTimeout(() => {
+                    createSession(sessionId, isLegacy, res);
+                }, statusCode === DisconnectReason.restartRequired ? 0 : parseInt(process.env.WA_SERVER_RECONNECT_INTERVAL ?? 0));
             }
 
-            try {
-                await connection.logout();
-            } catch {}
-            finally {
-                deleteSession(sessionId, isLegacy);
+            if (update.qr) {
+                if (res && !res.headersSent) {
+                    try {
+                        const qrCode = await toDataURL(update.qr);
+                        response(res, 200, true, 'QR code received, please scan the QR code.', { qr: qrCode });
+                        return;
+                    } catch {
+                        response(res, 500, false, 'Unable to create QR code.');
+                    }
+                }
+
+                try {
+                    await connection.logout();
+                } catch (error) {
+                    console.error('Error during logout after QR generation:', error);
+                } finally {
+                    deleteSession(sessionId, isLegacy);
+                }
             }
+        });
+
+        console.log(`Session created successfully for ${sessionId}`);
+    } catch (error) {
+        console.error('Error during session creation:', error);
+        if (res && !res.headersSent) {
+            response(res, 500, false, 'Unable to create session due to an error.');
         }
-    });
+    }
+};
+
+// Función para obtener una sesión por su ID
+const getSession = (sessionId) => {
+    return sessions.get(sessionId) ?? null;
 };
 
 // Función para establecer el estado del dispositivo
@@ -197,12 +196,14 @@ const deleteSession = (sessionId, isLegacy = false) => {
     retries.delete(sessionId);
 
     setDeviceStatus(sessionId, 0);
+
+    console.log(`Session ${sessionId} deleted successfully.`);
 };
 
 // Obtener lista de chats
 const getChatList = (sessionId, isLegacy = false) => {
     const suffix = isLegacy ? '@g.us' : '@s.whatsapp.net';
-    return getSession(sessionId).store.chats.filter(chat => chat.id.endsWith(suffix));
+    return getSession(sessionId)?.store?.chats.filter(chat => chat.id.endsWith(suffix)) || [];
 };
 
 // Verifica si el contacto o grupo existe
@@ -216,6 +217,7 @@ const isExists = async (session, jid, isGroup = false) => {
         }
         return Boolean(exists.id);
     } catch (error) {
+        console.error('Error checking existence of contact/group:', error);
         return false;
     }
 };
@@ -226,6 +228,7 @@ const sendMessage = async (session, receiver, message, delayTime = 1000) => {
         await delay(delayTime);
         return await session.sendMessage(receiver, message);
     } catch (error) {
+        console.error('Error sending message:', error);
         return Promise.reject(null);
     }
 };
@@ -267,6 +270,7 @@ const init = () => {
     });
 };
 
+// Exportar funciones
 export {
     cleanup, createSession, deleteSession, formatGroup, formatPhone, getChatList, getSession, init, isExists, isSessionExists, sendMessage
 };
